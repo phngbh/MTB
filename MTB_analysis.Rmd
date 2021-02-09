@@ -1,0 +1,173 @@
+---
+title: "MTB"
+author: "Phong N."
+date: "January 25, 2021"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(biomaRt)
+library(ComplexHeatmap)
+library(RColorBrewer)
+```
+
+
+## Oncoprint
+
+Steps to process the mutation data:
+
+1. Extract the small variant matrices as well as TMB and MSI info, combine into one table for all patients
+2. Filter variants that belong to c("synonymous_variant", "intron_variant", "upstream_gene_variant", "downstream_gene_variant", "3_prime_UTR_variant", "5_prime_UTR_variant", "splice_region_variant", "splice_region_variant:synonymous_variant", "splice_region_variant:intron_variant") and ones that have no gene annotations. Variants with AF>=0.9 were removed
+3. Classify SNVs (single Nu) and Indels (multi Nus)
+4. Get the gene coordinates using *biomaRt* (build 37)
+5. Fetch all SNPs corresponding to the coordinates using UCSC database
+6. Remove SNPs in our mutation data. Criteria: has the same location AND mutation type (SNV or Indel). In total 11830 mutations in all patients were removed. At the end 422 genes remain. 
+7. The TCGA label was manually added by me based on their description in clinical data. It could be inaccurate. 
+
+Further filterings need to be discussed since many samples and genes have low mutation rate. 
+
+```{r, fig.width=8, fig.height=8}
+mut = read.csv("CombinedVariant.txt", sep = "\t", header = F)
+colnames(mut) = c("Gene", "Chrom", "Pos", "Ref", "Alt", "AF", "Depth", "P.dot", "C.dot", "Cons", "Others")
+drop = c("synonymous_variant", "intron_variant", "upstream_gene_variant",
+         "downstream_gene_variant", "3_prime_UTR_variant", "5_prime_UTR_variant",
+         "splice_region_variant", "splice_region_variant:synonymous_variant",
+         "splice_region_variant:intron_variant")
+mut_fil = filter(mut, Gene != "" & AF < 0.9 & !Cons %in% drop)
+mut_fil$Type = ifelse(nchar(mut_fil$Ref) > 1 | nchar(mut_fil$Alt) > 1, "Indel", "SNV")
+mut_fil_snv = filter(mut_fil, Type == "SNV")
+
+#dbsnp = useMart("ENSEMBL_MART_SNP",host="grch37.ensembl.org", path="/biomart/martservice", dataset = "hsapiens_snp")
+# ensembl = useMart(biomart="ENSEMBL_MART_ENSEMBL", host="grch37.ensembl.org", path="/biomart/martservice", dataset = "hsapiens_gene_ensembl")
+# genes = unique(mut_fil$Gene)
+# genes.df = getBM(attributes = c("ensembl_gene_id", "chromosome_name", "start_position", "end_position",
+#                                 "external_gene_name"),
+#                  filters = "external_gene_name", values = genes, mart = ensembl)
+# genes.df = filter(genes.df, nchar(chromosome_name) <= 2)
+# # snps = getBM(attributes = c("refsnp_id", "refsnp_source", "chr_name",
+# #                             "chrom_start", "chrom_end", "associated_gene",
+# #                             "ensembl_gene_stable_id"), 
+# #              filters = "start", values = mut_fil_snv$Pos, ,mart = dbsnp)
+# write.table(genes.df$ensembl_gene_id, file = "geneID.txt", quote = F, col.names = F, row.names = F)
+# write.table(genes.df[,c("chromosome_name","start_position","end_position")], file = "gene.df.txt", quote = F, col.names = F, row.names = F)
+
+snp.list = read.table("snps_in_genes.txt", header = F, sep = "\t", check.names = F)
+snp.loc = as.character(unique(snp.list$V3))
+
+drop.loc = vector(mode = "integer")
+for (i in 1:nrow(mut_fil)) {
+  if (mut_fil$Pos[i] %in% snp.loc) {
+    index = match(mut_fil$Pos[i], as.character(snp.list$V3))
+    if (mut_fil$Type[i] == "SNV" & snp.list$V14[index] == "snv") {
+      drop.loc = c(drop.loc,i)
+    } else if (mut_fil$Type[i] == "Indel" & snp.list$V14[index] != "snv") {
+      drop.loc = c(drop.loc, i)
+    } else {
+      next
+    }
+  }
+}
+
+mut_final = mut_fil[-drop.loc,] %>% separate(col = "Others", into = c("Exon","TMB","MSI","Sample"), 
+                                             sep = " ")
+genes_final = unique(mut_final$Gene)
+mut_final_mat = pivot_wider(mut_final, id_cols = c("Gene","Sample","Type"), 
+                            names_from = "Sample", values_from = "Type", values_fill = list("0"),
+                            values_fn = list)
+for(j in 1:ncol(mut_final_mat)) {
+  for(i in 1:nrow(mut_final_mat)) {
+    if (length(mut_final_mat[,j][[1]][[i]]) > 1) {
+      if (all(mut_final_mat[,j][[1]][[i]] == rep("SNV", times = length(mut_final_mat[,j][[1]][[i]])))) {
+        mut_final_mat[,j][[1]][[i]] = "SNV"
+      } else if (all(mut_final_mat[,j][[1]][[i]] == rep("Indel", times = length(mut_final_mat[,j][[1]][[i]])))) {
+        mut_final_mat[,j][[1]][[i]] = "Indel"
+      } else {
+        mut_final_mat[,j][[1]][[i]] = "SNV;Indel"
+      }
+    } else {
+      next 
+    }
+  }
+  mut_final_mat[,j] = unlist(mut_final_mat[,j])
+}
+
+rn = mut_final_mat$Gene
+mut_final_mat = dplyr::select(mut_final_mat, -Gene) %>% as.matrix()
+rownames(mut_final_mat) = rn
+
+for (i in 1:nrow(mut_final_mat)){
+  for (j in 1:ncol(mut_final_mat)) {
+    if (mut_final_mat[i,j] == "0"){
+      mut_final_mat[i,j] = ""
+    }
+  }
+}
+
+sum_wt = apply(mut_final_mat, 1, function(x) sum(x==""))
+sum_wt = sum_wt[sum_wt >= 5 & sum_wt < 90]
+mut_final_mat = mut_final_mat[names(sum_wt),]
+
+clin = read.csv("clinical_data.csv", header = T, check.names = F, sep = ";")
+clin$Histo = gsub(pattern = "/", replacement = "-", clin$Histo) %>% 
+  gsub(pattern = "-0", replacement = "-")
+clin$Metastasierung = ifelse(!clin$Metastasierung %in% c("ja","nein"), "others", clin$Metastasierung)
+colnames(mut_final_mat)[9] = "H-2020-04049"
+index = match(colnames(mut_final_mat), clin$Histo)
+tcga = clin$TCGA[index]
+names(tcga) = colnames(mut_final_mat)
+metastasis = clin$Metastasierung[index]
+get_type_fun = function(x) strsplit(x, ";")[[1]]
+col = c(SNV = "red", Indel = "blue")
+tcga_col = c(brewer.pal(9,"Set1"),brewer.pal(8,"Set2"))
+names(tcga_col) = levels(as.factor(tcga))
+column_an = HeatmapAnnotation( cbar = anno_oncoprint_barplot(),
+                               TCGA = tcga, 
+                               Metastasis = metastasis,
+                               col = list(TCGA = tcga_col,
+                                          Metastasis = c("ja" = "magenta", "nein" = "green",
+                                                         "others" = "grey")))
+oncoPrint(mut_final_mat,
+          alter_fun = list(
+            SNV = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.9, 
+                                                 gp = gpar(fill = col["SNV"], col = NA)),
+            Indel = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.4, 
+                                                   gp = gpar(fill = col["Indel"], col = NA))
+          ), col = col, remove_empty_columns = T, remove_empty_rows = T,
+          top_annotation = column_an,
+          column_order = order(tcga), show_pct = F, row_names_side = "left", 
+          row_names_gp = gpar(fontsize = 4),
+          right_annotation = rowAnnotation(rbar = anno_oncoprint_barplot(axis_param = list(side = "bottom"))))
+
+oncoPrint(mut_final_mat,
+          alter_fun = list(
+            SNV = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.9, 
+                                                 gp = gpar(fill = col["SNV"], col = NA)),
+            Indel = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.4, 
+                                                   gp = gpar(fill = col["Indel"], col = NA))
+          ), col = col, remove_empty_columns = T, remove_empty_rows = T,
+          top_annotation = column_an,
+          show_pct = F, row_names_side = "left", 
+          row_names_gp = gpar(fontsize = 4))
+```
+
+
+## Hierarchical clustering
+
+Hiearrchical clustering using binary event matrix of all the genes (WT, SNV, Indel and SNV&Indel).
+
+```{r, fig.height=6, fig.width=8}
+mut_dummy = t(mut_final_mat) %>% as.data.frame %>% model.matrix(~ 0 + ., .) %>% t()
+column_an = HeatmapAnnotation( TCGA = tcga, 
+                               Metastasis = metastasis,
+                               col = list(TCGA = tcga_col,
+                                          Metastasis = c("ja" = "magenta", "nein" = "green",
+                                                         "others" = "grey")))
+Heatmap(mut_dummy, show_column_names = F, show_row_names = F,
+        name = "Mutation", top_annotation = column_an, column_title = "Patients", row_title = "Genes")
+```
